@@ -1,0 +1,9 @@
+/build/
+/cmake-build-*/
+/.cache/
+/CMakeFiles/
+compile_commands.json
+.DS_Store
+*.user
+trace.json
+*.json.tmp
