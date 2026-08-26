@@ -93,22 +93,61 @@ int main() {
   }
   const std::uint64_t dag_ns = ns_now() - dag_t0;
 
-  eoc::InferenceEngine infer;
+  eoc::InferenceEngine infer(eoc::InferenceBackend::SimulatedNpu, 2);
   eoc::TensorBuffer tensor(8);
   for (std::size_t i = 0; i < tensor.size(); ++i) {
     tensor.data()[i] = static_cast<float>(i);
   }
+  const std::uint64_t inf_t0 = ns_now();
   auto fut = infer.submit(tensor);
   const std::vector<float> out = fut.get();
+  const std::uint64_t inf_ns = ns_now() - inf_t0;
 
   eoc::AudioPipeline audio;
   eoc::VideoDecoderStub video;
   eoc::MetricsCollector metrics;
+
+  class BenchCore final : public eoc::ModuleBase {
+   public:
+    BenchCore() : ModuleBase("bench_core") { props().bind("workers", workers_); }
+    bool startup() override {
+      set_ready(true);
+      return true;
+    }
+    void shutdown() override { set_ready(false); }
+    int workers_ = 0;
+  };
+
+  class BenchRender final : public eoc::ModuleBase {
+   public:
+    BenchRender() : ModuleBase("bench_render") { props().bind("enabled", enabled_); }
+    bool startup() override {
+      set_ready(true);
+      return true;
+    }
+    void shutdown() override { set_ready(false); }
+    bool enabled_ = true;
+  };
+
+  BenchCore core_mod;
+  BenchRender render_mod;
+  core_mod.workers_ = static_cast<int>(graph.worker_count());
   eoc::ModuleRegistry modules;
+  const char* const render_deps[] = {"bench_core"};
+  const bool core_reg = modules.register_module(&core_mod);
+  const bool render_reg = modules.register_module(&render_mod, render_deps);
+  const bool modules_ok = core_reg && render_reg && modules.startup_all();
+  std::size_t module_props = 0;
+  if (auto* p = core_mod.properties()) {
+    module_props += p->size();
+  }
+  if (auto* p = render_mod.properties()) {
+    module_props += p->size();
+  }
+
   metrics.record("bench_complete", 1.0, prof.now_us());
   (void)audio;
   (void)video;
-  (void)modules;
   (void)out;
 
   prof.end_frame();
@@ -127,6 +166,14 @@ int main() {
   std::printf("trace_events: %zu\n", prof.event_count());
   std::printf("trace_exported: %d\n", exported ? 1 : 0);
   std::printf("inference_out0: %.1f\n", out.empty() ? -1.0 : static_cast<double>(out[0]));
+  std::printf("inference_backend: %s\n", infer.backend_name());
+  std::printf("inference_us: %.2f\n", static_cast<double>(inf_ns) / 1000.0);
+  std::printf("onnx_runtime: %d\n", infer.onnx_runtime_available() ? 1 : 0);
+  std::printf("modules_ready: %zu\n", modules.ready_count());
+  std::printf("module_properties: %zu\n", module_props);
+  std::printf("modules_ok: %d\n", modules_ok ? 1 : 0);
 
-  return counter.load() == kIndependent && dag_flag.load() == 12 ? 0 : 1;
+  const int rc = counter.load() == kIndependent && dag_flag.load() == 12 && modules_ok ? 0 : 1;
+  modules.shutdown_all();
+  return rc;
 }

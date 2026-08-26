@@ -35,6 +35,7 @@ class EOC_API TaskHandle {
 class EOC_API TaskGraph {
  public:
   explicit TaskGraph(std::size_t worker_count = 0, std::size_t max_tasks = 4096);
+  TaskGraph(std::size_t worker_count, std::size_t max_tasks, TaskLane pin_lane);
   ~TaskGraph();
 
   TaskGraph(const TaskGraph&) = delete;

@@ -17,6 +17,7 @@ endif()
 
 option(EOC_BUILD_TESTS "build googletest suites" ON)
 option(EOC_BUILD_BENCH "build standalone benchmark executable" ON)
+option(EOC_WITH_ONNX "link onnx runtime when found" ON)
 
 find_package(Threads REQUIRED)
 
@@ -29,6 +30,9 @@ set(EOC_CORE_SOURCES
   src/core/profiler.cpp
   src/ai/inference_engine.cpp
   src/ai/tensor_buffer.cpp
+  src/ai/simd_kernels.cpp
+  src/ai/simulated_npu.cpp
+  src/ai/onnx_session.cpp
   src/multimedia/audio_pipeline.cpp
   src/multimedia/video_decoder_stub.cpp
   src/telemetry/metrics_collector.cpp
@@ -51,7 +55,26 @@ target_include_directories(eoc_core PUBLIC
 
 target_compile_definitions(eoc_core PRIVATE EOC_BUILDING_SHARED)
 
-target_link_libraries(eoc_core PUBLIC Threads::Threads)
+target_link_libraries(eoc_core PUBLIC Threads::Threads ${CMAKE_DL_LIBS})
+
+if(EOC_WITH_ONNX)
+  find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+    HINTS ENV ONNXRUNTIME_ROOT
+    PATH_SUFFIXES include include/onnxruntime
+  )
+  find_library(ONNXRUNTIME_LIB onnxruntime
+    HINTS ENV ONNXRUNTIME_ROOT
+    PATH_SUFFIXES lib lib64
+  )
+  if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIB)
+    target_compile_definitions(eoc_core PRIVATE EOC_HAS_ONNXRUNTIME=1)
+    target_include_directories(eoc_core PRIVATE "${ONNXRUNTIME_INCLUDE_DIR}")
+    target_link_libraries(eoc_core PRIVATE "${ONNXRUNTIME_LIB}")
+    message(STATUS "onnx runtime: ${ONNXRUNTIME_LIB}")
+  else()
+    message(STATUS "onnx runtime not found, using simulated npu / simd")
+  endif()
+endif()
 
 set(EOC_WARNINGS -Wall -Wextra -Werror -pedantic -O3)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
@@ -85,14 +108,26 @@ if(EOC_BUILD_TESTS)
   enable_testing()
   include(GoogleTest)
 
+  add_library(eoc_test_plugin SHARED tests/test_plugin_module.cpp)
+  target_link_libraries(eoc_test_plugin PRIVATE eoc_core)
+  target_include_directories(eoc_test_plugin PRIVATE "${EOC_PUBLIC_INCLUDE}")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(eoc_test_plugin PRIVATE ${EOC_WARNINGS})
+  endif()
+
   add_executable(eoc_tests
     tests/test_allocators.cpp
     tests/test_task_graph.cpp
     tests/test_inference_pipeline.cpp
+    tests/test_modules.cpp
   )
+  add_dependencies(eoc_tests eoc_test_plugin)
   target_link_libraries(eoc_tests PRIVATE eoc_core GTest::gtest_main)
   target_include_directories(eoc_tests SYSTEM PRIVATE
     "${googletest_SOURCE_DIR}/googletest/include"
+  )
+  target_compile_definitions(eoc_tests PRIVATE
+    "EOC_TEST_PLUGIN_PATH=\"$<TARGET_FILE:eoc_test_plugin>\""
   )
   if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(eoc_tests PRIVATE ${EOC_WARNINGS})

@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <thread>
 #include <vector>
@@ -215,7 +216,7 @@ struct alignas(64) Worker {
 };
 
 struct TaskGraph::Impl {
-  explicit Impl(std::size_t worker_count, std::size_t max_tasks)
+  explicit Impl(std::size_t worker_count, std::size_t max_tasks, const TaskLane* pin_lane)
       : node_pool_(sizeof(TaskNode), max_tasks, 64),
         tasks_(max_tasks, nullptr),
         max_tasks_(max_tasks) {
@@ -228,7 +229,11 @@ struct TaskGraph::Impl {
     workers_.reserve(worker_count);
     for (std::size_t i = 0; i < worker_count; ++i) {
       auto worker = std::make_unique<Worker>();
-      worker->preferred = static_cast<TaskLane>(i % kTaskLaneCount);
+      if (pin_lane != nullptr) {
+        worker->preferred = *pin_lane;
+      } else {
+        worker->preferred = static_cast<TaskLane>(i % kTaskLaneCount);
+      }
       workers_.push_back(std::move(worker));
     }
     for (std::size_t i = 0; i < worker_count; ++i) {
@@ -315,7 +320,21 @@ struct TaskGraph::Impl {
         dispatch(succ);
       }
     }
+    recycle(node);
     outstanding_.fetch_sub(1, std::memory_order_release);
+  }
+
+  void recycle(TaskNode* node) {
+    if (node->destroy != nullptr) {
+      node->destroy(node->callable);
+    }
+    node->invoke = nullptr;
+    node->destroy = nullptr;
+    node->successor_count = 0;
+    node->successors.fill(nullptr);
+    node->pending.store(0, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(free_mu_);
+    free_nodes_.push_back(node);
   }
 
   void worker_loop(std::size_t index) {
@@ -348,6 +367,8 @@ struct TaskGraph::Impl {
   }
 
   void reset_nodes() {
+    std::lock_guard<std::mutex> lock(free_mu_);
+    free_nodes_.clear();
     for (std::size_t i = 0; i < task_count_; ++i) {
       TaskNode* node = tasks_[i];
       if (node == nullptr) {
@@ -372,12 +393,17 @@ struct TaskGraph::Impl {
   std::atomic<bool> stop_{false};
   std::atomic<std::uint32_t> outstanding_{0};
   std::atomic<bool> submitted_{false};
+  std::mutex free_mu_;
+  std::vector<TaskNode*> free_nodes_;
   std::size_t max_tasks_;
   std::size_t task_count_{0};
 };
 
 TaskGraph::TaskGraph(std::size_t worker_count, std::size_t max_tasks)
-    : impl_(new Impl(worker_count, max_tasks)) {}
+    : impl_(new Impl(worker_count, max_tasks, nullptr)) {}
+
+TaskGraph::TaskGraph(std::size_t worker_count, std::size_t max_tasks, TaskLane pin_lane)
+    : impl_(new Impl(worker_count, max_tasks, &pin_lane)) {}
 
 TaskGraph::~TaskGraph() {
   delete impl_;
@@ -392,17 +418,32 @@ TaskHandle TaskGraph::create_task_impl(TaskLane lane, const char* name, void (*i
       callable_align > 16) {
     return handle;
   }
-  if (impl_->task_count_ >= impl_->max_tasks_) {
-    return handle;
+
+  TaskNode* node = nullptr;
+  {
+    std::lock_guard<std::mutex> lock(impl_->free_mu_);
+    if (!impl_->free_nodes_.empty()) {
+      node = impl_->free_nodes_.back();
+      impl_->free_nodes_.pop_back();
+    }
   }
-  void* mem = impl_->node_pool_.allocate();
-  if (mem == nullptr) {
-    return handle;
+
+  if (node == nullptr) {
+    if (impl_->task_count_ >= impl_->max_tasks_) {
+      return handle;
+    }
+    void* mem = impl_->node_pool_.allocate();
+    if (mem == nullptr) {
+      return handle;
+    }
+    node = new (mem) TaskNode();
+    impl_->tasks_[impl_->task_count_++] = node;
   }
-  auto* node = new (mem) TaskNode();
+
   node->invoke = invoke;
   node->destroy = destroy;
-  node->pending.store(1, std::memory_order_relaxed);
+  const bool live = impl_->submitted_.load(std::memory_order_acquire);
+  node->pending.store(live ? 0u : 1u, std::memory_order_relaxed);
   node->successor_count = 0;
   node->lane = lane;
   node->name[0] = '\0';
@@ -415,9 +456,11 @@ TaskHandle TaskGraph::create_task_impl(TaskLane lane, const char* name, void (*i
   }
   node->successors.fill(nullptr);
   construct(node->callable, callable);
-  impl_->tasks_[impl_->task_count_++] = node;
   impl_->outstanding_.fetch_add(1, std::memory_order_relaxed);
   handle.node_ = node;
+  if (live) {
+    impl_->dispatch(node);
+  }
   return handle;
 }
 
