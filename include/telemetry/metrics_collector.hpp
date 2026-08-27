@@ -4,28 +4,30 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <string>
-#include <string_view>
 #include <vector>
 
 namespace eoc {
 
 struct MetricSample {
-  const char* name;
+  char name[32];
   double value;
   std::uint64_t timestamp_us;
 };
 
 class EOC_API MetricsCollector {
  public:
-  void record(const char* name, double value, std::uint64_t timestamp_us);
+  explicit MetricsCollector(std::size_t capacity = 1024);
+  ~MetricsCollector() = default;
+
+  bool record(const char* name, double value, std::uint64_t timestamp_us) noexcept;
   [[nodiscard]] std::size_t size() const noexcept;
+  [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] const MetricSample* data() const noexcept;
   void clear() noexcept;
 
  private:
-  std::vector<MetricSample> samples_;
-  std::vector<std::string> names_;
+  std::vector<MetricSample> slots_;
+  std::size_t count_;
 };
 
 }  // namespace eoc

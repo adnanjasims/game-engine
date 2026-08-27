@@ -1,6 +1,7 @@
 #include "core/profiler.hpp"
 
 #include <fstream>
+#include <ostream>
 #include <string_view>
 
 namespace eoc {
@@ -38,6 +39,13 @@ void json_escape(std::ostream& out, std::string_view s) {
         break;
     }
   }
+}
+
+void emit_comma(std::ostream& out, bool& first) {
+  if (!first) {
+    out << ",\n";
+  }
+  first = false;
 }
 
 }  // namespace
@@ -143,9 +151,45 @@ bool Profiler::export_chrome_trace(const char* path) const {
   if (count > kCapacity) {
     count = kCapacity;
   }
-  out << "{\n  \"traceEvents\": [\n";
+
+  std::uint32_t tids[64];
+  std::size_t ntid = 0;
+  auto remember_tid = [&](std::uint32_t tid) {
+    for (std::size_t i = 0; i < ntid; ++i) {
+      if (tids[i] == tid) {
+        return;
+      }
+    }
+    if (ntid < 64) {
+      tids[ntid++] = tid;
+    }
+  };
+  for (std::size_t i = 0; i < count; ++i) {
+    remember_tid(events_[i].tid);
+  }
+
+  const std::uint64_t end_ts = count == 0 ? now_us() : events_[count - 1].ts_us;
+  const std::uint64_t hits = cache_hits_.load(std::memory_order_acquire);
+  const std::uint64_t misses = cache_misses_.load(std::memory_order_acquire);
+  const std::size_t dropped = dropped_.load(std::memory_order_acquire);
+
+  out << "{\n  \"displayTimeUnit\": \"us\",\n  \"traceEvents\": [\n";
+  bool first = true;
+
+  emit_comma(out, first);
+  out << "    {\"name\":\"process_name\",\"ph\":\"M\",\"pid\":1,\"args\":{\"name\":\"eoc\"}}";
+  emit_comma(out, first);
+  out << "    {\"name\":\"process_labels\",\"ph\":\"M\",\"pid\":1,\"args\":{\"labels\":\"engineoptimizationcore\"}}";
+
+  for (std::size_t i = 0; i < ntid; ++i) {
+    emit_comma(out, first);
+    out << "    {\"name\":\"thread_name\",\"ph\":\"M\",\"pid\":1,\"tid\":" << tids[i]
+        << ",\"args\":{\"name\":\"worker-" << tids[i] << "\"}}";
+  }
+
   for (std::size_t i = 0; i < count; ++i) {
     const Event& e = events_[i];
+    emit_comma(out, first);
     out << "    {\"name\":\"";
     json_escape(out, e.name);
     out << "\",\"cat\":\"";
@@ -154,15 +198,23 @@ bool Profiler::export_chrome_trace(const char* path) const {
     if (e.phase == 'X') {
       out << ",\"dur\":" << e.dur_us;
     } else {
-      out << ",\"args\":{\"bytes\":" << e.counter << "}";
+      out << ",\"args\":{\"bytes\":" << e.counter << ",\"value\":" << e.counter << "}";
     }
     out << "}";
-    if (i + 1 < count) {
-      out << ",";
-    }
-    out << "\n";
   }
-  out << "  ]\n}\n";
+
+  //cache hit/miss and drop counters for chrome://tracing
+  emit_comma(out, first);
+  out << "    {\"name\":\"cache_hits\",\"cat\":\"cache\",\"ph\":\"C\",\"ts\":" << end_ts
+      << ",\"pid\":1,\"tid\":1,\"args\":{\"value\":" << hits << "}}";
+  emit_comma(out, first);
+  out << "    {\"name\":\"cache_misses\",\"cat\":\"cache\",\"ph\":\"C\",\"ts\":" << end_ts
+      << ",\"pid\":1,\"tid\":1,\"args\":{\"value\":" << misses << "}}";
+  emit_comma(out, first);
+  out << "    {\"name\":\"trace_dropped\",\"cat\":\"profiler\",\"ph\":\"C\",\"ts\":" << end_ts
+      << ",\"pid\":1,\"tid\":1,\"args\":{\"value\":" << dropped << "}}";
+
+  out << "\n  ]\n}\n";
   return static_cast<bool>(out);
 }
 

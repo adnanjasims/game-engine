@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -50,12 +51,7 @@ void bind_affinity(std::size_t worker_index) noexcept {
   CPU_SET(cpu, &set);
   pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &set);
 #elif defined(__APPLE__)
-  thread_affinity_policy_data_t policy;
-  policy.affinity_tag = static_cast<integer_t>(worker_index + 1);
-  const kern_return_t kr =
-      thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_AFFINITY_POLICY,
-                        reinterpret_cast<thread_policy_t>(&policy), THREAD_AFFINITY_POLICY_COUNT);
-  (void)kr;
+  (void)worker_index;
 #else
   (void)worker_index;
 #endif
@@ -81,7 +77,7 @@ const char* lane_name(TaskLane lane) noexcept {
 
 struct TaskNode {
   alignas(16) std::byte callable[kCallableBytes];
-  void (*invoke)(void*);
+  std::atomic<void (*)(void*)> invoke{nullptr};
   void (*destroy)(void*);
   std::atomic<std::uint32_t> pending;
   std::uint16_t successor_count;
@@ -112,7 +108,8 @@ class ChaseLevDeque {
   TaskNode* pop() noexcept {
     std::int64_t b = bottom_.load(std::memory_order_relaxed) - 1;
     bottom_.store(b, std::memory_order_relaxed);
-    std::int64_t t = top_.load(std::memory_order_acquire);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    std::int64_t t = top_.load(std::memory_order_relaxed);
     if (t > b) {
       bottom_.store(t, std::memory_order_relaxed);
       return nullptr;
@@ -131,6 +128,7 @@ class ChaseLevDeque {
 
   TaskNode* steal() noexcept {
     std::int64_t t = top_.load(std::memory_order_acquire);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     const std::int64_t b = bottom_.load(std::memory_order_acquire);
     if (t >= b) {
       return nullptr;
@@ -288,10 +286,12 @@ struct TaskGraph::Impl {
   TaskNode* take_task(std::size_t worker_index) noexcept {
     TaskNode* node = workers_[worker_index]->deque.pop();
     if (node != nullptr) {
+      Profiler::instance().record_cache_sample(true);
       return node;
     }
     node = inbox_.dequeue();
     if (node != nullptr) {
+      Profiler::instance().record_cache_sample(true);
       return node;
     }
     const std::size_t n = workers_.size();
@@ -299,6 +299,24 @@ struct TaskGraph::Impl {
       const std::size_t victim = (worker_index + k) % n;
       node = workers_[victim]->deque.steal();
       if (node != nullptr) {
+        Profiler::instance().record_cache_sample(false);
+        return node;
+      }
+    }
+    return nullptr;
+  }
+
+  TaskNode* help() noexcept {
+    TaskNode* node = inbox_.dequeue();
+    if (node != nullptr) {
+      Profiler::instance().record_cache_sample(false);
+      return node;
+    }
+    const std::size_t n = workers_.size();
+    for (std::size_t i = 0; i < n; ++i) {
+      node = workers_[i]->deque.steal();
+      if (node != nullptr) {
+        Profiler::instance().record_cache_sample(false);
         return node;
       }
     }
@@ -306,11 +324,13 @@ struct TaskGraph::Impl {
   }
 
   void execute(TaskNode* node) noexcept {
+    auto fn = node->invoke.exchange(nullptr, std::memory_order_acq_rel);
+    if (fn == nullptr) {
+      return;
+    }
     Profiler& prof = Profiler::instance();
     const std::uint64_t start = prof.now_us();
-    if (node->invoke != nullptr) {
-      node->invoke(node->callable);
-    }
+    fn(node->callable);
     const std::uint64_t end = prof.now_us();
     prof.record_span(node->name[0] != '\0' ? node->name : "task", lane_name(node->lane), start, end);
 
@@ -328,7 +348,7 @@ struct TaskGraph::Impl {
     if (node->destroy != nullptr) {
       node->destroy(node->callable);
     }
-    node->invoke = nullptr;
+    node->invoke.store(nullptr, std::memory_order_relaxed);
     node->destroy = nullptr;
     node->successor_count = 0;
     node->successors.fill(nullptr);
@@ -352,17 +372,8 @@ struct TaskGraph::Impl {
         cpu_pause();
         continue;
       }
-      const std::uint32_t v = signal_.load(std::memory_order_acquire);
-      node = take_task(index);
-      if (node != nullptr) {
-        idle = 0;
-        execute(node);
-        continue;
-      }
-      if (stop_.load(std::memory_order_acquire)) {
-        break;
-      }
-      signal_.wait(v, std::memory_order_relaxed);
+      idle = 0;
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
   }
 
@@ -440,7 +451,7 @@ TaskHandle TaskGraph::create_task_impl(TaskLane lane, const char* name, void (*i
     impl_->tasks_[impl_->task_count_++] = node;
   }
 
-  node->invoke = invoke;
+  node->invoke.store(invoke, std::memory_order_release);
   node->destroy = destroy;
   const bool live = impl_->submitted_.load(std::memory_order_acquire);
   node->pending.store(live ? 0u : 1u, std::memory_order_relaxed);
@@ -492,7 +503,12 @@ void TaskGraph::submit() {
 
 void TaskGraph::wait() noexcept {
   while (impl_->outstanding_.load(std::memory_order_acquire) != 0) {
-    cpu_pause();
+    TaskNode* node = impl_->help();
+    if (node != nullptr) {
+      impl_->execute(node);
+    } else {
+      std::this_thread::sleep_for(std::chrono::microseconds(1));
+    }
   }
 }
 

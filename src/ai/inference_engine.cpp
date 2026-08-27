@@ -160,7 +160,6 @@ InferenceEngine::InferenceEngine(InferenceBackend backend, std::size_t worker_co
 
 InferenceEngine::~InferenceEngine() {
   if (impl_ != nullptr) {
-    impl_->graph.wait();
     delete impl_;
   }
 }

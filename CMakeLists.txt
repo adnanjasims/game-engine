@@ -35,7 +35,9 @@ set(EOC_CORE_SOURCES
   src/ai/onnx_session.cpp
   src/multimedia/audio_pipeline.cpp
   src/multimedia/video_decoder_stub.cpp
+  src/multimedia/zero_copy_ring.cpp
   src/telemetry/metrics_collector.cpp
+  src/telemetry/network_telemetry.cpp
 )
 
 add_library(eoc_core SHARED ${EOC_CORE_SOURCES})
@@ -120,6 +122,9 @@ if(EOC_BUILD_TESTS)
     tests/test_task_graph.cpp
     tests/test_inference_pipeline.cpp
     tests/test_modules.cpp
+    tests/test_multimedia.cpp
+    tests/test_telemetry.cpp
+    tests/test_profiler.cpp
   )
   add_dependencies(eoc_tests eoc_test_plugin)
   target_link_libraries(eoc_tests PRIVATE eoc_core GTest::gtest_main)
